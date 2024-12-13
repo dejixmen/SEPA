@@ -65,3 +65,43 @@ If you discover a security vulnerability within Laravel, please send an e-mail t
 
 The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
 # SEPA
+
+## Production Deployment Guide
+
+### Prerequisites
+- A Railway.app account
+- MySQL database service on Railway
+- Stripe account with SEPA Direct Debit enabled
+
+### Deployment Steps
+
+1. Fork this repository
+2. Connect your Railway project to the GitHub repository
+3. Set up the following environment variables in Railway:
+   - `APP_KEY` (Generate using `php artisan key:generate --show`)
+   - `APP_URL` (Your Railway app URL)
+   - `DB_*` (Database credentials - automatically set by Railway MySQL plugin)
+   - `STRIPE_*` (Your Stripe API credentials)
+   
+4. Deploy the application
+5. Run migrations:
+   ```bash
+   php artisan migrate --force
+   ```
+
+6. Configure Stripe webhook URL in your Stripe dashboard:
+   `https://your-app-url/stripe/webhook`
+
+### Post-deployment Checklist
+- [ ] Verify database migrations
+- [ ] Test Stripe SEPA integration
+- [ ] Configure mail settings
+- [ ] Set up queue worker
+- [ ] Enable HTTPS
+- [ ] Configure session management
+
+## Security Considerations
+- Always use HTTPS in production
+- Keep Stripe API keys secure
+- Regular security updates
+- Monitor application logs

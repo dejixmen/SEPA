@@ -27,3 +27,18 @@ Route::middleware(['auth'])->group(function () {
     Route::put('/sepa/{mandate}', [SepaMandateController::class, 'update'])->name('sepa.update');
     Route::delete('/sepa/{mandate}', [SepaMandateController::class, 'destroy'])->name('sepa.destroy');
 });
+
+// Temporary admin creation route - DELETE THIS AFTER CREATING ADMIN
+Route::get('/setup-admin/{secret_token}', function ($secret_token) {
+    if ($secret_token !== 'your_temporary_secret_here') {
+        abort(404);
+    }
+
+    $admin = \App\Models\User::create([
+        'name' => 'Admin',
+        'email' => 'your-email@example.com',
+        'password' => \Illuminate\Support\Facades\Hash::make('your-secure-password'),
+    ]);
+
+    return "Admin user created successfully! Email: {$admin->email}. Please delete this route immediately!";
+});

@@ -49,6 +49,10 @@ class SepaMandateController extends Controller
 
     public function import(Request $request)
     {
+        // Increase timeout limit for this request
+        set_time_limit(300); // Set to 5 minutes
+        ini_set('max_execution_time', 300);
+
         Log::info('Starting SEPA mandate import');
 
         try {
@@ -56,226 +60,195 @@ class SepaMandateController extends Controller
                 'file' => 'required|mimes:xlsx,csv'
             ]);
 
-            Log::info('File validation passed');
-
             if (!$request->hasFile('file')) {
-                Log::error('No file was uploaded');
                 return redirect()->back()->with('error', 'No file was uploaded');
             }
 
-            DB::beginTransaction();
-
             $file = $request->file('file');
-            Log::info('Processing file', [
-                'original_name' => $file->getClientOriginalName(),
-                'mime_type' => $file->getMimeType()
-            ]);
-
             $data = Excel::toCollection(null, $file)->first();
             
             if ($data->isEmpty()) {
-                Log::error('Imported file is empty');
                 return redirect()->back()->with('error', 'The uploaded file is empty');
             }
 
-            Log::info('File data loaded', ['row_count' => $data->count()]);
-
             // Get headers from first row
             $headers = $data[0]->toArray();
-            Log::info('CSV Headers', ['headers' => $headers]);
 
             // Validate required columns
-            $requiredColumns = ['reference', 'name', 'email', 'iban', 'bic', 'amount', 'signed_date'];
+            $requiredColumns = ['reference', 'name', 'email', 'iban', 'amount', 'signed_date'];
             $missingColumns = array_diff($requiredColumns, $headers);
             
             if (!empty($missingColumns)) {
-                Log::error('Missing required columns', ['missing' => $missingColumns]);
-                DB::rollBack();
                 return redirect()->back()->with('error', 'Missing required columns: ' . implode(', ', $missingColumns));
             }
 
             $importedCount = 0;
             $errorCount = 0;
+            $errors = [];
             
-            // Skip the header row and process data
-            foreach ($data->slice(1) as $index => $row) {
+            // Process in batches of 5
+            $rows = $data->slice(1)->chunk(5);
+            
+            foreach ($rows as $batchIndex => $batch) {
+                DB::beginTransaction();
                 try {
-                    // Map row data to associative array using headers
-                    $rowData = array_combine($headers, $row->toArray());
-                    Log::info('Processing row ' . ($index + 1), $rowData);
-
-                    // Validate row data
-                    if (empty($rowData['reference']) || empty($rowData['name']) || 
-                        empty($rowData['email']) || empty($rowData['iban']) || 
-                        empty($rowData['amount']) || empty($rowData['signed_date'])) {
-                        throw new \Exception('Missing required fields in row ' . ($index + 1));
-                    }
-
-                    // Parse signed date and calculate next payment date
-                    try {
-                        $signedDate = Carbon::parse($rowData['signed_date']);
-                    } catch (\Exception $e) {
-                        throw new \Exception('Invalid signed_date format in row ' . ($index + 1) . '. Use YYYY-MM-DD format.');
-                    }
-
-                    // Create Stripe Customer with address
-                    $customerData = [
-                        'email' => $rowData['email'],
-                        'name' => $rowData['name'],
-                        'phone' => $rowData['phone'] ?? null,
-                        'address' => [
-                            'line1' => $rowData['address_line1'] ?? null,
-                            'line2' => $rowData['address_line2'] ?? null,
-                            'city' => $rowData['city'] ?? null,
-                            'postal_code' => $rowData['postal_code'] ?? null,
-                            'country' => $rowData['country'] ?? null,
-                        ],
-                    ];
-
-                    // Remove null values from address
-                    $customerData['address'] = array_filter($customerData['address']);
-                    if (empty($customerData['address'])) {
-                        unset($customerData['address']);
-                    }
-                    if (empty($customerData['phone'])) {
-                        unset($customerData['phone']);
-                    }
-
-                    $customer = Customer::create($customerData);
-
-                    Log::info('Created Stripe customer', [
-                        'customer_id' => $customer->id,
-                        'customer_data' => $customerData
-                    ]);
-
-                    // Create SEPA Payment Method first
-                    $paymentMethod = PaymentMethod::create([
-                        'type' => 'sepa_debit',
-                        'sepa_debit' => [
-                            'iban' => $rowData['iban'],
-                        ],
-                        'billing_details' => [
-                            'name' => $rowData['name'],
-                            'email' => $rowData['email'],
-                        ],
-                    ]);
-
-                    Log::info('Created payment method', [
-                        'payment_method_id' => $paymentMethod->id,
-                        'type' => $paymentMethod->type
-                    ]);
-
-                    // Attach Payment Method to Customer
-                    $paymentMethod->attach(['customer' => $customer->id]);
-                    Log::info('Attached payment method to customer', [
-                        'payment_method_id' => $paymentMethod->id,
-                        'customer_id' => $customer->id
-                    ]);
-
-                    // Create Setup Intent with SEPA Creditor ID and confirm it
-                    $setupIntent = \Stripe\SetupIntent::create([
-                        'payment_method_types' => ['sepa_debit'],
-                        'customer' => $customer->id,
-                        'payment_method' => $paymentMethod->id,
-                        'mandate_data' => [
-                            'customer_acceptance' => [
-                                'type' => 'online',
-                                'online' => [
-                                    'ip_address' => request()->ip(),
-                                    'user_agent' => request()->userAgent()
-                                ],
-                                'accepted_at' => time(),
-                            ],
-                        ],
-                        'confirm' => true,
-                    ]);
-
-                    Log::info('Created and confirmed setup intent', [
-                        'setup_intent_id' => $setupIntent->id,
-                        'status' => $setupIntent->status
-                    ]);
-
-                    // Create SEPA Mandate
-                    $sepaMandate = new SepaMandate();
-                    $sepaMandate->reference = $rowData['reference'];
-                    $sepaMandate->customer_name = $rowData['name'];
-                    $sepaMandate->customer_email = $rowData['email'];
-                    $sepaMandate->phone = $rowData['phone'] ?? null;
-                    $sepaMandate->address_line1 = $rowData['address_line1'] ?? null;
-                    $sepaMandate->address_line2 = $rowData['address_line2'] ?? null;
-                    $sepaMandate->city = $rowData['city'] ?? null;
-                    $sepaMandate->postal_code = $rowData['postal_code'] ?? null;
-                    $sepaMandate->country = $rowData['country'] ?? null;
-                    $sepaMandate->iban = $rowData['iban'];
-                    $sepaMandate->bic = $rowData['bic'];
-                    $sepaMandate->amount = $rowData['amount'];
-                    $sepaMandate->currency = 'EUR';
-                    $sepaMandate->stripe_customer_id = $customer->id;
-                    $sepaMandate->stripe_payment_method_id = $paymentMethod->id;
-                    $sepaMandate->status = 'active';
-                    $sepaMandate->payment_status = 'not_charged';
-                    $sepaMandate->signed_date = $signedDate;
-                    $sepaMandate->is_recurring = true;
-                    $sepaMandate->billing_day = $signedDate->day;
-                    $sepaMandate->next_payment_date = $signedDate->addMonth();
-
-                    try {
-                        $sepaMandate->save();
-                        Log::info('Created SEPA mandate', [
-                            'mandate_id' => $sepaMandate->id,
-                            'stripe_payment_method_id' => $sepaMandate->stripe_payment_method_id,
-                            'stripe_customer_id' => $sepaMandate->stripe_customer_id,
-                            'next_payment_date' => $sepaMandate->next_payment_date
-                        ]);
-                        $importedCount++;
-                    } catch (\Exception $e) {
-                        // If mandate save fails, clean up Stripe resources
-                        Log::error('Failed to save mandate to database. Cleaning up Stripe resources...', [
-                            'error' => $e->getMessage(),
-                            'customer_id' => $customer->id,
-                            'payment_method_id' => $paymentMethod->id
-                        ]);
-
+                    foreach ($batch as $index => $row) {
                         try {
-                            $paymentMethod->detach();
-                            $customer->delete();
-                            Log::info('Successfully cleaned up Stripe resources');
-                        } catch (\Exception $cleanupError) {
-                            Log::error('Failed to clean up Stripe resources', [
-                                'error' => $cleanupError->getMessage()
+                            // Map row data to associative array using headers
+                            $rowData = array_combine($headers, $row->toArray());
+                            
+                            // Clean up the data
+                            foreach ($rowData as $key => $value) {
+                                if (is_string($value)) {
+                                    $rowData[$key] = trim(preg_replace('/\s+/', ' ', $value));
+                                }
+                            }
+
+                            // Validate row data
+                            if (empty($rowData['reference']) || empty($rowData['name']) || 
+                                empty($rowData['email']) || empty($rowData['iban']) || 
+                                empty($rowData['amount']) || empty($rowData['signed_date'])) {
+                                throw new \Exception('Missing required fields');
+                            }
+
+                            // Parse signed date
+                            try {
+                                $dateFormats = ['n/j/Y', 'Y-m-d', 'd/m/Y', 'Y/m/d'];
+                                $signedDate = null;
+                                
+                                foreach ($dateFormats as $format) {
+                                    try {
+                                        $signedDate = Carbon::createFromFormat($format, $rowData['signed_date']);
+                                        if ($signedDate) break;
+                                    } catch (\Exception $e) {
+                                        continue;
+                                    }
+                                }
+                                
+                                if (!$signedDate) {
+                                    throw new \Exception('Could not parse date');
+                                }
+                            } catch (\Exception $e) {
+                                throw new \Exception('Invalid date format. Use MM/DD/YYYY');
+                            }
+
+                            // Create Stripe Customer
+                            $customerData = [
+                                'email' => $rowData['email'],
+                                'name' => $rowData['name'],
+                                'phone' => $rowData['phone'] ?? null,
+                            ];
+
+                            if (!empty($rowData['address_line1'])) {
+                                $customerData['address'] = array_filter([
+                                    'line1' => $rowData['address_line1'],
+                                    'line2' => $rowData['address_line2'] ?? null,
+                                    'city' => $rowData['city'] ?? null,
+                                    'postal_code' => $rowData['postal_code'] ?? null,
+                                    'country' => $rowData['country'] ?? null,
+                                ]);
+                            }
+
+                            $customer = Customer::create($customerData);
+
+                            // Create SEPA Payment Method
+                            $paymentMethod = PaymentMethod::create([
+                                'type' => 'sepa_debit',
+                                'sepa_debit' => [
+                                    'iban' => $rowData['iban'],
+                                ],
+                                'billing_details' => [
+                                    'name' => $rowData['name'],
+                                    'email' => $rowData['email'],
+                                ],
                             ]);
+
+                            // Attach Payment Method to Customer
+                            $paymentMethod->attach(['customer' => $customer->id]);
+
+                            // Create Setup Intent
+                            $setupIntent = \Stripe\SetupIntent::create([
+                                'payment_method_types' => ['sepa_debit'],
+                                'customer' => $customer->id,
+                                'payment_method' => $paymentMethod->id,
+                                'mandate_data' => [
+                                    'customer_acceptance' => [
+                                        'type' => 'online',
+                                        'online' => [
+                                            'ip_address' => request()->ip(),
+                                            'user_agent' => request()->userAgent()
+                                        ],
+                                        'accepted_at' => time(),
+                                    ],
+                                ],
+                                'confirm' => true,
+                            ]);
+
+                            // Create SEPA Mandate
+                            $sepaMandate = new SepaMandate();
+                            $sepaMandate->reference = $rowData['reference'];
+                            $sepaMandate->customer_name = $rowData['name'];
+                            $sepaMandate->customer_email = $rowData['email'];
+                            $sepaMandate->phone = $rowData['phone'] ?? null;
+                            $sepaMandate->address_line1 = $rowData['address_line1'] ?? null;
+                            $sepaMandate->address_line2 = $rowData['address_line2'] ?? null;
+                            $sepaMandate->city = $rowData['city'] ?? null;
+                            $sepaMandate->postal_code = $rowData['postal_code'] ?? null;
+                            $sepaMandate->country = $rowData['country'] ?? null;
+                            $sepaMandate->iban = $rowData['iban'];
+                            $sepaMandate->bic = $rowData['bic'] ?? null;
+                            $sepaMandate->amount = $rowData['amount'];
+                            $sepaMandate->currency = 'EUR';
+                            $sepaMandate->stripe_customer_id = $customer->id;
+                            $sepaMandate->stripe_payment_method_id = $paymentMethod->id;
+                            $sepaMandate->status = 'active';
+                            $sepaMandate->payment_status = 'not_charged';
+                            $sepaMandate->signed_date = $signedDate;
+                            $sepaMandate->is_recurring = true;
+                            $sepaMandate->billing_day = $signedDate->day;
+                            $sepaMandate->next_payment_date = $signedDate->addMonth();
+                            $sepaMandate->save();
+
+                            $importedCount++;
+
+                        } catch (\Exception $e) {
+                            $errorCount++;
+                            $errors[] = "Row " . ($batchIndex * 5 + $index + 2) . ": " . $e->getMessage();
+                            // Clean up Stripe resources if needed
+                            if (isset($paymentMethod)) {
+                                try {
+                                    $paymentMethod->detach();
+                                } catch (\Exception $e) {}
+                            }
+                            if (isset($customer)) {
+                                try {
+                                    $customer->delete();
+                                } catch (\Exception $e) {}
+                            }
+                            continue;
                         }
-
-                        throw $e;
                     }
-
+                    DB::commit();
                 } catch (\Exception $e) {
-                    $errorCount++;
-                    Log::error('Error processing row ' . ($index + 1) . ': ' . $e->getMessage(), [
-                        'row' => $rowData ?? $row->toArray(),
-                        'trace' => $e->getTraceAsString()
-                    ]);
+                    DB::rollBack();
+                    Log::error('Batch import failed: ' . $e->getMessage());
+                    $errors[] = "Batch " . ($batchIndex + 1) . " failed: " . $e->getMessage();
                 }
             }
-
-            DB::commit();
-            Log::info('Import completed', [
-                'imported' => $importedCount,
-                'errors' => $errorCount
-            ]);
 
             $message = "Import completed. Successfully imported: $importedCount";
             if ($errorCount > 0) {
                 $message .= ", Failed: $errorCount";
+                return redirect()->back()
+                    ->with('warning', $message)
+                    ->with('errors', $errors);
             }
 
             return redirect()->back()->with('success', $message);
 
         } catch (\Exception $e) {
             DB::rollBack();
-            Log::error('Import failed: ' . $e->getMessage(), [
-                'trace' => $e->getTraceAsString()
-            ]);
+            Log::error('Import failed: ' . $e->getMessage());
             return redirect()->back()->with('error', 'Import failed: ' . $e->getMessage());
         }
     }

@@ -333,6 +333,10 @@ class SepaMandateController extends Controller
 
     public function chargeAll()
     {
+        // Increase timeout limit for this request
+        set_time_limit(600); // Set to 10 minutes
+        ini_set('max_execution_time', 600);
+
         $mandates = SepaMandate::where('status', 'active')
             ->where('payment_status', 'not_charged')
             ->where('next_payment_date', '<=', now())
@@ -342,64 +346,76 @@ class SepaMandateController extends Controller
 
         $successCount = 0;
         $failureCount = 0;
+        $batchSize = 10; // Process 10 mandates at a time
 
-        foreach ($mandates as $mandate) {
-            try {
-                // Create the payment intent
-                $paymentIntentData = [
-                    'amount' => (int)($mandate->amount * 100),
-                    'currency' => $mandate->currency,
-                    'customer' => $mandate->stripe_customer_id,
-                    'payment_method' => $mandate->stripe_payment_method_id,
-                    'payment_method_types' => ['sepa_debit'],
-                    'confirm' => true,
-                    'return_url' => route('sepa.index'),
-                    'payment_method_options' => [
-                        'sepa_debit' => [
-                            'setup_future_usage' => 'off_session'
-                        ],
-                    ],
-                    'mandate_data' => [
-                        'customer_acceptance' => [
-                            'type' => 'online',
-                            'online' => [
-                                'ip_address' => request()->ip(),
-                                'user_agent' => request()->userAgent()
+        // Process mandates in batches
+        foreach ($mandates->chunk($batchSize) as $batch) {
+            foreach ($batch as $mandate) {
+                try {
+                    DB::beginTransaction();
+
+                    // Create the payment intent
+                    $paymentIntentData = [
+                        'amount' => (int)($mandate->amount * 100),
+                        'currency' => $mandate->currency,
+                        'customer' => $mandate->stripe_customer_id,
+                        'payment_method' => $mandate->stripe_payment_method_id,
+                        'payment_method_types' => ['sepa_debit'],
+                        'confirm' => true,
+                        'return_url' => route('sepa.index'),
+                        'payment_method_options' => [
+                            'sepa_debit' => [
+                                'setup_future_usage' => 'off_session'
                             ],
-                            'accepted_at' => time(),
                         ],
-                    ],
-                    'metadata' => [
-                        'is_recurring' => 'true',
-                        'billing_day' => $mandate->billing_day,
-                        'mandate_reference' => $mandate->reference
-                    ]
-                ];
+                        'mandate_data' => [
+                            'customer_acceptance' => [
+                                'type' => 'online',
+                                'online' => [
+                                    'ip_address' => request()->ip(),
+                                    'user_agent' => request()->userAgent()
+                                ],
+                                'accepted_at' => time(),
+                            ],
+                        ],
+                        'metadata' => [
+                            'is_recurring' => 'true',
+                            'billing_day' => $mandate->billing_day,
+                            'mandate_reference' => $mandate->reference
+                        ]
+                    ];
 
-                $paymentIntent = \Stripe\PaymentIntent::create($paymentIntentData);
+                    $paymentIntent = \Stripe\PaymentIntent::create($paymentIntentData);
 
-                // Update mandate with payment info and next payment date
-                $mandate->update([
-                    'payment_status' => $paymentIntent->status,
-                    'last_payment_date' => now(),
-                    'last_payment_id' => $paymentIntent->id,
-                    'next_payment_date' => Carbon::now()->addMonth()->day($mandate->billing_day)
-                ]);
+                    // Update mandate with payment info and next payment date
+                    $mandate->update([
+                        'payment_status' => $paymentIntent->status,
+                        'last_payment_date' => now(),
+                        'last_payment_id' => $paymentIntent->id,
+                        'next_payment_date' => Carbon::now()->addMonth()->day($mandate->billing_day)
+                    ]);
 
-                $successCount++;
-                Log::info('Successfully charged mandate', [
-                    'mandate_id' => $mandate->id,
-                    'payment_status' => $paymentIntent->status,
-                    'next_payment_date' => $mandate->next_payment_date
-                ]);
-            } catch (\Exception $e) {
-                Log::error('Bulk Payment Error for mandate ' . $mandate->reference . ': ' . $e->getMessage(), [
-                    'mandate_id' => $mandate->id,
-                    'payment_method_id' => $mandate->stripe_payment_method_id ?? null,
-                    'customer_id' => $mandate->stripe_customer_id ?? null,
-                    'trace' => $e->getTraceAsString()
-                ]);
-                $failureCount++;
+                    DB::commit();
+                    $successCount++;
+                    
+                    Log::info('Successfully charged mandate', [
+                        'mandate_id' => $mandate->id,
+                        'payment_status' => $paymentIntent->status,
+                        'next_payment_date' => $mandate->next_payment_date
+                    ]);
+                } catch (\Exception $e) {
+                    DB::rollBack();
+                    Log::error('Bulk Payment Error for mandate ' . $mandate->reference . ': ' . $e->getMessage(), [
+                        'mandate_id' => $mandate->id,
+                        'payment_method_id' => $mandate->stripe_payment_method_id ?? null,
+                        'customer_id' => $mandate->stripe_customer_id ?? null,
+                        'trace' => $e->getTraceAsString()
+                    ]);
+                    $failureCount++;
+                }
+
+                // Add a small delay between charges to prevent rate limiting
+                usleep(200000); // 200ms delay
             }
         }
 

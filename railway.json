@@ -1,7 +1,8 @@
 {
   "$schema": "https://railway.app/railway.schema.json",
   "build": {
-    "builder": "NIXPACKS"
+    "builder": "NIXPACKS",
+    "buildCommand": "echo 'max_execution_time=600' >> /etc/php/8.1/fpm/conf.d/user.ini && echo 'max_input_time=600' >> /etc/php/8.1/fpm/conf.d/user.ini"
   },
   "deploy": {
     "startCommand": "php artisan migrate --force && php artisan config:cache && php artisan route:cache && php artisan view:cache && php artisan serve --host 0.0.0.0 --port $PORT",
